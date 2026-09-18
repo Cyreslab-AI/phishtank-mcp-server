@@ -38,6 +38,203 @@ import {
   PhishTankError,
 } from "./types/phishtank-types.js";
 
+// JSON Schema fragments describing the record shapes the handlers below
+// actually build (mirroring src/types/phishtank-types.ts), reused across
+// each tool's `outputSchema` and the `structuredContent` returned alongside text.
+const PHISH_DETAIL_SCHEMA = {
+  type: "object",
+  properties: {
+    ip_address: { type: "string" },
+    cidr_block: { type: "string" },
+    announcing_network: { type: "string" },
+    rir: { type: "string" },
+    detail_time: { type: "string" },
+  },
+};
+
+const PHISH_ENTRY_SCHEMA = {
+  type: "object",
+  properties: {
+    phish_id: { type: "number" },
+    url: { type: "string" },
+    phish_detail_url: { type: "string" },
+    submission_time: { type: "string" },
+    verified: { type: "string" },
+    verification_time: { type: "string" },
+    online: { type: "string" },
+    target: { type: "string" },
+    details: { type: "array", items: PHISH_DETAIL_SCHEMA },
+  },
+  required: ["phish_id", "url"],
+};
+
+const URL_CHECK_RESULT_SCHEMA = {
+  type: "object",
+  properties: {
+    meta: {
+      type: "object",
+      properties: {
+        timestamp: { type: "string" },
+        format: { type: "string" },
+      },
+    },
+    results: {
+      type: "object",
+      properties: {
+        url: { type: "string" },
+        in_database: { type: "boolean" },
+        phish_id: { type: "number" },
+        phish_detail_page: { type: "string" },
+        verified: { type: "boolean" },
+        verified_at: { type: "string" },
+        valid: { type: "boolean" },
+        submitted_at: { type: "string" },
+      },
+    },
+  },
+};
+
+const RATE_LIMIT_INFO_SCHEMA = {
+  type: "object",
+  properties: {
+    interval: { type: "string" },
+    limit: { type: "number" },
+    count: { type: "number" },
+    remaining: { type: "number" },
+  },
+};
+
+const CHECK_URL_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    cached: { type: "boolean" },
+    result: URL_CHECK_RESULT_SCHEMA,
+    rate_limit_info: RATE_LIMIT_INFO_SCHEMA,
+    summary: { type: "string" },
+  },
+  required: ["result", "summary"],
+};
+
+const CHECK_MULTIPLE_URLS_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    batch_results: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          url: { type: "string" },
+          success: { type: "boolean" },
+          data: { type: "object" },
+          error: { type: "string" },
+        },
+        required: ["url", "success"],
+      },
+    },
+    summary: {
+      type: "object",
+      properties: {
+        total: { type: "number" },
+        successful: { type: "number" },
+        failed: { type: "number" },
+        delay_used: { type: "number" },
+      },
+    },
+  },
+  required: ["batch_results", "summary"],
+};
+
+const GET_RECENT_PHISH_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    total_entries: { type: "number" },
+    filtered_entries: { type: "number" },
+    include_offline: { type: "boolean" },
+    entries: { type: "array", items: PHISH_ENTRY_SCHEMA },
+    summary: { type: "string" },
+  },
+  required: ["entries", "summary"],
+};
+
+const SEARCH_PHISH_BY_TARGET_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    search_target: { type: "string" },
+    verified_only: { type: "boolean" },
+    matches_found: { type: "number" },
+    entries: { type: "array", items: PHISH_ENTRY_SCHEMA },
+    summary: { type: "string" },
+  },
+  required: ["entries", "summary"],
+};
+
+const GET_PHISH_DETAILS_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    phish_id: { type: "number" },
+    found: { type: "boolean" },
+    details: PHISH_ENTRY_SCHEMA,
+    summary: { type: "string" },
+  },
+  required: ["phish_id", "found", "summary"],
+};
+
+const GET_PHISH_STATS_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    statistics: {
+      type: "object",
+      properties: {
+        total_phish: { type: "number" },
+        total_verified: { type: "number" },
+        total_online: { type: "number" },
+        top_targets: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              target: { type: "string" },
+              count: { type: "number" },
+            },
+            required: ["target", "count"],
+          },
+        },
+        recent_submissions: { type: "number" },
+        date_range: {
+          type: "object",
+          properties: {
+            from: { type: "string" },
+            to: { type: "string" },
+          },
+        },
+      },
+    },
+    analysis_period_days: { type: "number" },
+    summary: { type: "string" },
+  },
+  required: ["statistics", "summary"],
+};
+
+const SEARCH_PHISH_BY_DATE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    date_range: {
+      type: "object",
+      properties: {
+        start: { type: "string" },
+        end: { type: "string" },
+      },
+    },
+    matches_found: { type: "number" },
+    entries: { type: "array", items: PHISH_ENTRY_SCHEMA },
+    summary: { type: "string" },
+  },
+  required: ["entries", "summary"],
+};
+
+// Read-only, external-API-lookup annotations shared by every tool in this server.
+const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
+
 class PhishTankServer {
   private server: Server;
   private axiosInstance: AxiosInstance;
@@ -117,6 +314,8 @@ class PhishTankServer {
             },
             required: ["url"],
           },
+          outputSchema: CHECK_URL_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
         },
         {
           name: "check_multiple_urls",
@@ -143,6 +342,8 @@ class PhishTankServer {
             },
             required: ["urls"],
           },
+          outputSchema: CHECK_MULTIPLE_URLS_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
         },
         {
           name: "get_recent_phish",
@@ -164,6 +365,8 @@ class PhishTankServer {
               },
             },
           },
+          outputSchema: GET_RECENT_PHISH_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
         },
         {
           name: "search_phish_by_target",
@@ -190,6 +393,8 @@ class PhishTankServer {
             },
             required: ["target"],
           },
+          outputSchema: SEARCH_PHISH_BY_TARGET_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
         },
         {
           name: "get_phish_details",
@@ -204,6 +409,8 @@ class PhishTankServer {
             },
             required: ["phish_id"],
           },
+          outputSchema: GET_PHISH_DETAILS_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
         },
         {
           name: "get_phish_stats",
@@ -225,6 +432,8 @@ class PhishTankServer {
               },
             },
           },
+          outputSchema: GET_PHISH_STATS_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
         },
         {
           name: "search_phish_by_date",
@@ -252,6 +461,8 @@ class PhishTankServer {
             },
             required: ["start_date", "end_date"],
           },
+          outputSchema: SEARCH_PHISH_BY_DATE_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
         },
       ],
     }));
@@ -336,21 +547,19 @@ class PhishTankServer {
     const cacheKey = `url_check:${url}`;
     const cached = this.cache.get<PhishTankUrlCheckResponse>(cacheKey);
     if (cached) {
+      const cachedPayload = {
+        cached: true,
+        result: cached,
+        summary: this.getUrlCheckSummary(cached),
+      };
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                cached: true,
-                result: cached,
-                summary: this.getUrlCheckSummary(cached),
-              },
-              null,
-              2,
-            ),
+            text: JSON.stringify(cachedPayload, null, 2),
           },
         ],
+        structuredContent: cachedPayload,
       };
     }
 
@@ -380,21 +589,20 @@ class PhishTankServer {
     // Cache the result
     this.cache.set(cacheKey, result);
 
+    const payload = {
+      result,
+      rate_limit_info: this.extractRateLimitInfo(response.headers),
+      summary: this.getUrlCheckSummary(result),
+    };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              result,
-              rate_limit_info: this.extractRateLimitInfo(response.headers),
-              summary: this.getUrlCheckSummary(result),
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
+      structuredContent: payload,
     };
   }
 
@@ -446,25 +654,24 @@ class PhishTankServer {
     const successCount = results.filter((r) => r.success).length;
     const failureCount = results.length - successCount;
 
+    const payload = {
+      batch_results: results,
+      summary: {
+        total: urls.length,
+        successful: successCount,
+        failed: failureCount,
+        delay_used: delay,
+      },
+    };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              batch_results: results,
-              summary: {
-                total: urls.length,
-                successful: successCount,
-                failed: failureCount,
-                delay_used: delay,
-              },
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
+      structuredContent: payload,
     };
   }
 
@@ -497,23 +704,22 @@ class PhishTankServer {
       )
       .slice(0, limit);
 
+    const payload = {
+      total_entries: database.meta?.total_entries || 0,
+      filtered_entries: entries.length,
+      include_offline: includeOffline,
+      entries,
+      summary: `Retrieved ${entries.length} recent phishing URLs${includeOffline ? " (including offline)" : " (online only)"}`,
+    };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              total_entries: database.meta?.total_entries || 0,
-              filtered_entries: entries.length,
-              include_offline: includeOffline,
-              entries,
-              summary: `Retrieved ${entries.length} recent phishing URLs${includeOffline ? " (including offline)" : " (online only)"}`,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
+      structuredContent: payload,
     };
   }
 
@@ -558,23 +764,22 @@ class PhishTankServer {
       )
       .slice(0, limit);
 
+    const payload = {
+      search_target: target,
+      verified_only: verifiedOnly,
+      matches_found: entries.length,
+      entries,
+      summary: `Found ${entries.length} phishing URLs targeting "${target}"${verifiedOnly ? " (verified only)" : ""}`,
+    };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              search_target: target,
-              verified_only: verifiedOnly,
-              matches_found: entries.length,
-              entries,
-              summary: `Found ${entries.length} phishing URLs targeting "${target}"${verifiedOnly ? " (verified only)" : ""}`,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
+      structuredContent: payload,
     };
   }
 
@@ -600,40 +805,37 @@ class PhishTankServer {
     const entry = database.entries?.find((e) => e.phish_id === phishId);
 
     if (!entry) {
+      const notFoundPayload = {
+        phish_id: phishId,
+        found: false,
+        summary: `Phish ID ${phishId} not found in database`,
+      };
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                phish_id: phishId,
-                found: false,
-                summary: `Phish ID ${phishId} not found in database`,
-              },
-              null,
-              2,
-            ),
+            text: JSON.stringify(notFoundPayload, null, 2),
           },
         ],
+        structuredContent: notFoundPayload,
       };
     }
+
+    const payload = {
+      phish_id: phishId,
+      found: true,
+      details: entry,
+      summary: `Details for phish ID ${phishId}: ${entry.url} (Target: ${entry.target || "Unknown"})`,
+    };
 
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              phish_id: phishId,
-              found: true,
-              details: entry,
-              summary: `Details for phish ID ${phishId}: ${entry.url} (Target: ${entry.target || "Unknown"})`,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
+      structuredContent: payload,
     };
   }
 
@@ -692,21 +894,20 @@ class PhishTankServer {
       },
     };
 
+    const payload = {
+      statistics: stats,
+      analysis_period_days: days,
+      summary: `Analyzed ${totalPhish} phishing submissions over ${days} days. ${totalVerified} verified, ${totalOnline} currently online.`,
+    };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              statistics: stats,
-              analysis_period_days: days,
-              summary: `Analyzed ${totalPhish} phishing submissions over ${days} days. ${totalVerified} verified, ${totalOnline} currently online.`,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
+      structuredContent: payload,
     };
   }
 
@@ -764,25 +965,24 @@ class PhishTankServer {
       )
       .slice(0, limit);
 
+    const payload = {
+      date_range: {
+        start: startDate,
+        end: endDate,
+      },
+      matches_found: entries.length,
+      entries,
+      summary: `Found ${entries.length} phishing URLs submitted between ${startDate} and ${endDate}`,
+    };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              date_range: {
-                start: startDate,
-                end: endDate,
-              },
-              matches_found: entries.length,
-              entries,
-              summary: `Found ${entries.length} phishing URLs submitted between ${startDate} and ${endDate}`,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
+      structuredContent: payload,
     };
   }
 
