@@ -66,6 +66,9 @@ export interface PhishTankConfig {
   rateLimitMax: number;
   cacheTimeout: number; // in milliseconds
   maxDatabaseAge: number; // in milliseconds
+  // Optional: enables the Google Safe Browsing tools (check_url_safe_browsing,
+  // check_url_multi_source). PhishTank-only tools work without it.
+  googleSafeBrowsingApiKey?: string;
 }
 
 // API response wrapper for tool results

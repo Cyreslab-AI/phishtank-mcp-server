@@ -15,6 +15,15 @@
  *
  * The PhishTank API is free to use but has rate limits.
  * API keys are recommended for higher rate limits and database downloads.
+ *
+ * This server also queries Google Safe Browsing (v4 Lookup API) as a
+ * second, complementary threat intelligence source. PhishTank's own
+ * registration has been closed to new users since 2020 and the service has
+ * been reported to be undergoing a ground-up rebuild, so Safe Browsing's
+ * broader, real-time database provides useful cross-verification alongside
+ * PhishTank's community-curated phishing reports. Safe Browsing tools are
+ * optional and only activate when GOOGLE_SAFE_BROWSING_API_KEY is set;
+ * PhishTank-only tools work exactly as before regardless.
  */
 
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
@@ -37,6 +46,15 @@ import {
   CacheEntry,
   PhishTankError,
 } from "./types/phishtank-types.js";
+import {
+  SafeBrowsingFindResponse,
+  SafeBrowsingMatch,
+  SafeBrowsingResult,
+  MultiSourceCheckResult,
+  MultiSourcePhishTankResult,
+  MultiSourceSafeBrowsingResult,
+  MultiSourceVerdict,
+} from "./types/safebrowsing-types.js";
 
 // JSON Schema fragments describing the record shapes the handlers below
 // actually build (mirroring src/types/phishtank-types.ts), reused across
@@ -232,6 +250,85 @@ const SEARCH_PHISH_BY_DATE_OUTPUT_SCHEMA = {
   required: ["entries", "summary"],
 };
 
+// --- Google Safe Browsing schema fragments (mirroring
+// src/types/safebrowsing-types.ts), for the check_url_safe_browsing and
+// check_url_multi_source tools' outputSchema/structuredContent. ---
+
+const SAFE_BROWSING_MATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    threatType: { type: "string" },
+    platformType: { type: "string" },
+    threatEntryType: { type: "string" },
+    threat: {
+      type: "object",
+      properties: { url: { type: "string" } },
+    },
+    cacheDuration: { type: "string" },
+  },
+  required: ["threatType", "platformType"],
+};
+
+const CHECK_URL_SAFE_BROWSING_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    cached: { type: "boolean" },
+    url: { type: "string" },
+    threats_found: { type: "boolean" },
+    matches: { type: "array", items: SAFE_BROWSING_MATCH_SCHEMA },
+    checked_at: { type: "string" },
+    summary: { type: "string" },
+  },
+  required: ["url", "threats_found", "matches", "summary"],
+};
+
+const MULTI_SOURCE_PHISHTANK_SCHEMA = {
+  type: "object",
+  properties: {
+    checked: { type: "boolean" },
+    available: { type: "boolean" },
+    in_database: { type: "boolean" },
+    verified: { type: "boolean" },
+    phish_id: { type: "number" },
+    phish_detail_page: { type: "string" },
+    error: { type: "string" },
+  },
+  required: ["checked", "available"],
+};
+
+const MULTI_SOURCE_SAFE_BROWSING_SCHEMA = {
+  type: "object",
+  properties: {
+    checked: { type: "boolean" },
+    available: { type: "boolean" },
+    threats_found: { type: "boolean" },
+    matches: { type: "array", items: SAFE_BROWSING_MATCH_SCHEMA },
+    error: { type: "string" },
+  },
+  required: ["checked", "available"],
+};
+
+const CHECK_URL_MULTI_SOURCE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    url: { type: "string" },
+    sources: {
+      type: "object",
+      properties: {
+        phishtank: MULTI_SOURCE_PHISHTANK_SCHEMA,
+        safeBrowsing: MULTI_SOURCE_SAFE_BROWSING_SCHEMA,
+      },
+      required: ["phishtank", "safeBrowsing"],
+    },
+    verdict: {
+      type: "string",
+      enum: ["malicious", "likely_safe", "inconclusive", "unknown"],
+    },
+    summary: { type: "string" },
+  },
+  required: ["url", "sources", "verdict", "summary"],
+};
+
 // Read-only, external-API-lookup annotations shared by every tool in this server.
 const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
 
@@ -264,6 +361,7 @@ class PhishTankServer {
       rateLimitMax: process.env.PHISHTANK_API_KEY ? 100 : 10, // Higher limit with API key
       cacheTimeout: 300000, // 5 minutes for URL checks
       maxDatabaseAge: 3600000, // 1 hour for database cache
+      googleSafeBrowsingApiKey: process.env.GOOGLE_SAFE_BROWSING_API_KEY,
     };
 
     // Initialize cache
@@ -464,6 +562,42 @@ class PhishTankServer {
           outputSchema: SEARCH_PHISH_BY_DATE_OUTPUT_SCHEMA,
           annotations: READ_ONLY_ANNOTATIONS,
         },
+        {
+          name: "check_url_safe_browsing",
+          description:
+            "Check a URL against Google Safe Browsing for malware, social engineering (phishing), unwanted software, and potentially harmful application threats. Complements PhishTank with Google's broader, real-time threat database. Requires the GOOGLE_SAFE_BROWSING_API_KEY environment variable to be set.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              url: {
+                type: "string",
+                description:
+                  "The URL to check (must be a complete URL with protocol)",
+              },
+            },
+            required: ["url"],
+          },
+          outputSchema: CHECK_URL_SAFE_BROWSING_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
+        },
+        {
+          name: "check_url_multi_source",
+          description:
+            "Check a URL against both PhishTank and Google Safe Browsing in one call and return a combined verdict with clear per-source attribution. Recommended for the most reliable phishing/malware assessment, since the two sources use independent detection methods and databases. If GOOGLE_SAFE_BROWSING_API_KEY is not configured, only PhishTank is checked and the result notes that Safe Browsing was skipped.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              url: {
+                type: "string",
+                description:
+                  "The URL to check (must be a complete URL with protocol)",
+              },
+            },
+            required: ["url"],
+          },
+          outputSchema: CHECK_URL_MULTI_SOURCE_OUTPUT_SCHEMA,
+          annotations: READ_ONLY_ANNOTATIONS,
+        },
       ],
     }));
 
@@ -486,6 +620,10 @@ class PhishTankServer {
               return await this.getPhishStats(request.params.arguments);
             case "search_phish_by_date":
               return await this.searchPhishByDate(request.params.arguments);
+            case "check_url_safe_browsing":
+              return await this.checkUrlSafeBrowsing(request.params.arguments);
+            case "check_url_multi_source":
+              return await this.checkUrlMultiSource(request.params.arguments);
             default:
               throw new ProtocolError(
                 ProtocolErrorCode.MethodNotFound,
@@ -495,6 +633,12 @@ class PhishTankServer {
         } catch (error) {
           if (axios.isAxiosError(error)) {
             const statusCode = error.response?.status;
+            const requestUrl = error.config?.url || "";
+            const sourceLabel = requestUrl.includes(
+              "safebrowsing.googleapis.com",
+            )
+              ? "Google Safe Browsing API"
+              : "PhishTank API";
 
             if (statusCode === 509) {
               return {
@@ -508,11 +652,17 @@ class PhishTankServer {
               };
             }
 
+            const errorDetail = error.response?.data
+              ? typeof error.response.data === "string"
+                ? error.response.data
+                : JSON.stringify(error.response.data)
+              : error.message;
+
             return {
               content: [
                 {
                   type: "text",
-                  text: `PhishTank API error (${statusCode}): ${error.response?.data || error.message}`,
+                  text: `${sourceLabel} error (${statusCode}): ${errorDetail}`,
                 },
               ],
               isError: true,
@@ -984,6 +1134,300 @@ class PhishTankServer {
       ],
       structuredContent: payload,
     };
+  }
+
+  private async checkUrlSafeBrowsing(args: any) {
+    const url = String(args?.url || "").trim();
+
+    if (!url) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        "URL parameter is required",
+      );
+    }
+
+    if (!this.isValidUrl(url)) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        "Invalid URL format",
+      );
+    }
+
+    const cacheKey = `safe_browsing:${url}`;
+    const cached = this.cache.get<SafeBrowsingResult>(cacheKey);
+    if (cached) {
+      const cachedPayload = {
+        cached: true,
+        ...cached,
+        summary: this.getSafeBrowsingSummary(cached),
+      };
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(cachedPayload, null, 2),
+          },
+        ],
+        structuredContent: cachedPayload,
+      };
+    }
+
+    const matches = await this.querySafeBrowsing(url);
+    const result: SafeBrowsingResult = {
+      url,
+      threats_found: matches.length > 0,
+      matches,
+      checked_at: new Date().toISOString(),
+    };
+
+    this.cache.set(cacheKey, result);
+
+    const payload = {
+      ...result,
+      summary: this.getSafeBrowsingSummary(result),
+    };
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(payload, null, 2),
+        },
+      ],
+      structuredContent: payload,
+    };
+  }
+
+  private async checkUrlMultiSource(args: any) {
+    const url = String(args?.url || "").trim();
+
+    if (!url) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        "URL parameter is required",
+      );
+    }
+
+    if (!this.isValidUrl(url)) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        "Invalid URL format",
+      );
+    }
+
+    // --- Source 1: PhishTank ---
+    let phishtankSource: MultiSourcePhishTankResult;
+    try {
+      const ptResult = await this.checkUrl({ url });
+      const ptData = JSON.parse(ptResult.content[0].text as string);
+      const results = ptData.result?.results;
+      phishtankSource = {
+        checked: true,
+        available: true,
+        in_database: Boolean(results?.in_database),
+        verified: Boolean(results?.verified),
+        phish_id: results?.phish_id,
+        phish_detail_page: results?.phish_detail_page,
+      };
+    } catch (error) {
+      phishtankSource = {
+        checked: true,
+        available: false,
+        error: this.describeError(error, "PhishTank"),
+      };
+    }
+
+    // --- Source 2: Google Safe Browsing (optional) ---
+    let safeBrowsingSource: MultiSourceSafeBrowsingResult;
+    if (!this.config.googleSafeBrowsingApiKey) {
+      safeBrowsingSource = {
+        checked: false,
+        available: false,
+        error:
+          "GOOGLE_SAFE_BROWSING_API_KEY is not configured; Safe Browsing check was skipped",
+      };
+    } else {
+      try {
+        const matches = await this.querySafeBrowsing(url);
+        safeBrowsingSource = {
+          checked: true,
+          available: true,
+          threats_found: matches.length > 0,
+          matches,
+        };
+      } catch (error) {
+        safeBrowsingSource = {
+          checked: true,
+          available: false,
+          error: this.describeError(error, "Google Safe Browsing"),
+        };
+      }
+    }
+
+    // --- Combined verdict ---
+    const phishtankMalicious = Boolean(
+      phishtankSource.available &&
+        phishtankSource.in_database &&
+        phishtankSource.verified,
+    );
+    const safeBrowsingMalicious = Boolean(
+      safeBrowsingSource.available && safeBrowsingSource.threats_found,
+    );
+    const anyAvailable =
+      phishtankSource.available || safeBrowsingSource.available;
+
+    let verdict: MultiSourceVerdict;
+    if (phishtankMalicious || safeBrowsingMalicious) {
+      verdict = "malicious";
+    } else if (!anyAvailable) {
+      verdict = "unknown";
+    } else if (
+      phishtankSource.available &&
+      phishtankSource.in_database &&
+      !phishtankSource.verified
+    ) {
+      verdict = "inconclusive";
+    } else {
+      verdict = "likely_safe";
+    }
+
+    const summary = this.getMultiSourceSummary(
+      verdict,
+      phishtankSource,
+      safeBrowsingSource,
+      phishtankMalicious,
+      safeBrowsingMalicious,
+    );
+
+    const payload: MultiSourceCheckResult = {
+      url,
+      sources: {
+        phishtank: phishtankSource,
+        safeBrowsing: safeBrowsingSource,
+      },
+      verdict,
+      summary,
+    };
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(payload, null, 2),
+        },
+      ],
+      structuredContent: payload,
+    };
+  }
+
+  // Queries the Google Safe Browsing v4 Lookup API (threatMatches:find) for
+  // a single URL. Throws a clear ProtocolError if no API key is configured,
+  // and lets axios errors (auth failures, network errors, etc.) propagate
+  // for the caller to handle (either the outer tools/call catch block, or
+  // checkUrlMultiSource's own per-source error handling).
+  private async querySafeBrowsing(url: string): Promise<SafeBrowsingMatch[]> {
+    if (!this.config.googleSafeBrowsingApiKey) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidRequest,
+        "GOOGLE_SAFE_BROWSING_API_KEY is not configured. Enable the 'Safe Browsing API' on a Google Cloud project, create an API key, and set it as an environment variable to use this tool.",
+      );
+    }
+
+    const requestBody = {
+      client: {
+        clientId: "phishtank-mcp-server",
+        clientVersion: "1.0.0",
+      },
+      threatInfo: {
+        threatTypes: [
+          "MALWARE",
+          "SOCIAL_ENGINEERING",
+          "UNWANTED_SOFTWARE",
+          "POTENTIALLY_HARMFUL_APPLICATION",
+        ],
+        platformTypes: ["ANY_PLATFORM"],
+        threatEntryTypes: ["URL"],
+        threatEntries: [{ url }],
+      },
+    };
+
+    const response = await this.axiosInstance.post<SafeBrowsingFindResponse>(
+      "https://safebrowsing.googleapis.com/v4/threatMatches:find",
+      requestBody,
+      {
+        params: { key: this.config.googleSafeBrowsingApiKey },
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+
+    return response.data.matches || [];
+  }
+
+  private getSafeBrowsingSummary(result: SafeBrowsingResult): string {
+    if (!result.threats_found) {
+      return "URL not flagged by Google Safe Browsing (likely safe)";
+    }
+
+    const threatTypes = [
+      ...new Set(result.matches.map((m) => m.threatType)),
+    ].join(", ");
+    return `⚠️ THREAT DETECTED by Google Safe Browsing - ${threatTypes}`;
+  }
+
+  private getMultiSourceSummary(
+    verdict: MultiSourceVerdict,
+    phishtank: MultiSourcePhishTankResult,
+    safeBrowsing: MultiSourceSafeBrowsingResult,
+    phishtankMalicious: boolean,
+    safeBrowsingMalicious: boolean,
+  ): string {
+    if (verdict === "malicious") {
+      const flaggedBy: string[] = [];
+      if (phishtankMalicious) {
+        flaggedBy.push(`PhishTank (verified phish ID ${phishtank.phish_id})`);
+      }
+      if (safeBrowsingMalicious) {
+        const threatTypes = [
+          ...new Set((safeBrowsing.matches || []).map((m) => m.threatType)),
+        ].join(", ");
+        flaggedBy.push(`Google Safe Browsing (${threatTypes})`);
+      }
+      return `⚠️ PHISHING/MALWARE DETECTED - flagged by: ${flaggedBy.join(" and ")}`;
+    }
+
+    if (verdict === "unknown") {
+      return "Unable to determine URL safety - no source could be checked (missing GOOGLE_SAFE_BROWSING_API_KEY and/or a PhishTank error; see sources for details)";
+    }
+
+    if (verdict === "inconclusive") {
+      return "URL found in PhishTank database but not yet verified; no threats found by Google Safe Browsing";
+    }
+
+    const checkedSources: string[] = [];
+    if (phishtank.available) checkedSources.push("PhishTank");
+    if (safeBrowsing.available) checkedSources.push("Google Safe Browsing");
+    return `URL not flagged as malicious by any checked source (${checkedSources.join(", ")})`;
+  }
+
+  // Renders a caught error as a short, source-labeled string for embedding
+  // in a per-source result (used by checkUrlMultiSource, which needs to
+  // keep going after one source fails rather than aborting the whole call).
+  private describeError(error: unknown, source: string): string {
+    if (axios.isAxiosError(error)) {
+      const statusCode = error.response?.status;
+      const detail = error.response?.data
+        ? typeof error.response.data === "string"
+          ? error.response.data
+          : JSON.stringify(error.response.data)
+        : error.message;
+      return `${source} API error (${statusCode}): ${detail}`;
+    }
+    if (error instanceof ProtocolError) {
+      return error.message;
+    }
+    return error instanceof Error
+      ? error.message
+      : `${source} check failed with an unknown error`;
   }
 
   private async downloadDatabase(): Promise<PhishTankDatabase> {
